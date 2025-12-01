@@ -32,3 +32,11 @@ target_link_libraries(temp-opt
     clangAST
     clangBasic
 )
+
+# Make lit test usable via "lit test" from the build directory
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test)
+configure_file(
+  ${CMAKE_SOURCE_DIR}/test/lit.cfg.py
+  ${CMAKE_BINARY_DIR}/test/lit.cfg.py
+  COPYONLY
+)
