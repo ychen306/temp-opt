@@ -1,14 +1,18 @@
 #include "clang/AST/AST.h"
+#include "clang/AST/PrettyPrinter.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -121,6 +125,16 @@ public:
     }
   }
 
+  const llvm::SmallPtrSet<const FunctionTemplateDecl *, 32> &
+  getFunctionTemplates() const {
+    return AllFunctionTemplates;
+  }
+
+  const llvm::SmallPtrSet<const ClassTemplateDecl *, 32> &
+  getClassTemplates() const {
+    return AllClassTemplates;
+  }
+
 private:
 
   ASTContext &Context;
@@ -135,67 +149,168 @@ public:
 
   // Called by Clang when the AST for a translation unit is ready.
   void HandleTranslationUnit(ASTContext &Ctx) override {
-    // Kick off the traversal.
     Visitor.run();
 
-    SmallVector<const FunctionTemplateDecl *, 32> UninstFuncs;
-    SmallVector<const ClassTemplateDecl *, 32> UninstClasses;
-    Visitor.collectUninstantiated(UninstFuncs, UninstClasses);
-
     const SourceManager &SM = Ctx.getSourceManager();
+    FileID MainFileID = SM.getMainFileID();
 
-    LLVM_DEBUG(dbgs() << "=== Uninstantiated function templates ===\n");
-    for (const FunctionTemplateDecl *FTD : UninstFuncs) {
-      SourceLocation Loc = FTD->getLocation();
-      FullSourceLoc FullLoc(Loc, SM);
-      StringRef FileName = SM.getFilename(Loc);
-      if (FileName.empty())
-        FileName = "<unknown>";
+    PrintingPolicy Policy(Ctx.getLangOpts());
+    Policy.adjustForCPlusPlus();
 
-      LLVM_DEBUG(dbgs() << "  " << FTD->getNameAsString() << " at "
-                        << FileName << ":"
-                        << FullLoc.getSpellingLineNumber() << ":"
-                        << FullLoc.getSpellingColumnNumber() << "\n");
+    auto buildTemplateArgString = [&](const TemplateArgumentList &Args) {
+      std::string S;
+      raw_string_ostream OS(S);
+      OS << "<";
+      for (unsigned I = 0, E = Args.size(); I != E; ++I) {
+        if (I)
+          OS << ", ";
+        Args[I].print(Policy, OS, true);
+      }
+      OS << ">";
+      OS.flush();
+      return S;
+    };
+
+    const auto &FuncTemplates = Visitor.getFunctionTemplates();
+    const auto &ClassTemplates = Visitor.getClassTemplates();
+
+    for (const FunctionTemplateDecl *FTD : FuncTemplates) {
+      const FunctionDecl *TemplateFD = FTD->getTemplatedDecl();
+      SourceLocation Loc = TemplateFD->getLocation();
+      FileID FID = SM.getFileID(SM.getSpellingLoc(Loc));
+      if (FID != MainFileID)
+        continue;
+
+      llvm::StringSet<> SeenArgs;
+      std::string InsertText;
+
+      for (auto *SpecFD : FTD->specializations()) {
+        auto *Info = SpecFD->getTemplateSpecializationInfo();
+        if (!Info)
+          continue;
+
+        TemplateSpecializationKind K = Info->getTemplateSpecializationKind();
+        if (K != TSK_ImplicitInstantiation)
+          continue;
+
+        // Only consider instantiations whose point of instantiation is
+        // in the main file (i.e., triggered by user code in this TU).
+        SourceLocation POI = Info->getPointOfInstantiation();
+        if (POI.isInvalid())
+          continue;
+        FileID InstFID = SM.getFileID(SM.getSpellingLoc(POI));
+        if (InstFID != MainFileID)
+          continue;
+
+        const TemplateArgumentList *Args = Info->TemplateArguments;
+        if (!Args)
+          continue;
+
+        std::string ArgStr = buildTemplateArgString(*Args);
+        if (!SeenArgs.insert(ArgStr).second)
+          continue;
+
+        QualType RetTy = SpecFD->getReturnType();
+        std::string RetStr = RetTy.getAsString(Policy);
+        std::string QualName = SpecFD->getQualifiedNameAsString();
+
+        std::string ParamStr;
+        for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
+          if (I)
+            ParamStr += ", ";
+          QualType PTy = SpecFD->getParamDecl(I)->getType();
+          ParamStr += PTy.getAsString(Policy);
+        }
+
+        InsertText += "\n";
+        InsertText += "template ";
+        InsertText += RetStr;
+        InsertText += " ";
+        InsertText += QualName;
+        InsertText += ArgStr;
+        InsertText += "(";
+        InsertText += ParamStr;
+        InsertText += ")";
+        InsertText += ";";
+      }
+
+      if (InsertText.empty())
+        continue;
+
+      const FunctionDecl *InsertFD = TemplateFD;
+      const FunctionDecl *DefFD = nullptr;
+      if (TemplateFD->hasBody(DefFD) && DefFD)
+        InsertFD = DefFD;
+
+      SourceLocation End = InsertFD->getSourceRange().getEnd();
+      End = Lexer::getLocForEndOfToken(End, 0, SM, Ctx.getLangOpts());
+      TheRewriter.InsertTextAfter(End, InsertText);
     }
 
-    LLVM_DEBUG(dbgs() << "=== Uninstantiated class templates ===\n");
-    for (const ClassTemplateDecl *CTD : UninstClasses) {
-      SourceLocation Loc = CTD->getLocation();
-      FullSourceLoc FullLoc(Loc, SM);
-      StringRef FileName = SM.getFilename(Loc);
-      if (FileName.empty())
-        FileName = "<unknown>";
+    for (const ClassTemplateDecl *CTD : ClassTemplates) {
+      const CXXRecordDecl *RD = CTD->getTemplatedDecl();
+      SourceLocation Loc = RD->getLocation();
+      FileID FID = SM.getFileID(SM.getSpellingLoc(Loc));
+      if (FID != MainFileID)
+        continue;
 
-      LLVM_DEBUG(dbgs() << "  " << CTD->getNameAsString() << " at "
-                        << FileName << ":"
-                        << FullLoc.getSpellingLineNumber() << ":"
-                        << FullLoc.getSpellingColumnNumber() << "\n");
+      const CXXRecordDecl *DefRD = RD->getDefinition();
+      const CXXRecordDecl *InsertRD = DefRD ? DefRD : RD;
+
+      llvm::StringSet<> SeenArgs;
+      std::string InsertText;
+
+      for (auto *CTSD : CTD->specializations()) {
+        TemplateSpecializationKind K = CTSD->getSpecializationKind();
+        if (K != TSK_ImplicitInstantiation)
+          continue;
+
+        SourceLocation POI = CTSD->getPointOfInstantiation();
+        if (POI.isInvalid())
+          continue;
+        FileID InstFID = SM.getFileID(SM.getSpellingLoc(POI));
+        if (InstFID != MainFileID)
+          continue;
+
+        const TemplateArgumentList &Args = CTSD->getTemplateArgs();
+        std::string ArgStr = buildTemplateArgString(Args);
+        if (!SeenArgs.insert(ArgStr).second)
+          continue;
+
+        std::string QualName = RD->getQualifiedNameAsString();
+        const char *Kw = "class";
+        if (RD->isStruct())
+          Kw = "struct";
+        else if (RD->isUnion())
+          Kw = "union";
+
+        InsertText += "\n";
+        InsertText += "template ";
+        InsertText += Kw;
+        InsertText += " ";
+        InsertText += QualName;
+        InsertText += ArgStr;
+        InsertText += ";";
+      }
+
+      if (InsertText.empty())
+        continue;
+
+      SourceLocation End = InsertRD->getBraceRange().getEnd();
+      if (End.isInvalid())
+        End = InsertRD->getSourceRange().getEnd();
+
+      SourceLocation AfterSemi =
+          Lexer::findLocationAfterToken(End, tok::semi, SM, Ctx.getLangOpts(),
+                                        /*SkipTrailingWhitespaceAndNewLine=*/true);
+      if (AfterSemi.isInvalid())
+        AfterSemi = Lexer::getLocForEndOfToken(End, 0, SM, Ctx.getLangOpts());
+
+      TheRewriter.InsertTextAfter(AfterSemi, InsertText);
     }
 
     if (OutputFile.empty())
       return;
-
-    FileID MainFileID = SM.getMainFileID();
-
-    auto removeIfInMainFile = [&](const Decl *D) {
-      SourceLocation Begin = D->getBeginLoc();
-      if (Begin.isInvalid())
-        return;
-      FileID FID = SM.getFileID(SM.getSpellingLoc(Begin));
-      if (FID != MainFileID)
-        return;
-
-      SourceRange Range = D->getSourceRange();
-      if (Range.isInvalid())
-        return;
-
-      TheRewriter.RemoveText(Range);
-    };
-
-    for (const FunctionTemplateDecl *FTD : UninstFuncs)
-      removeIfInMainFile(FTD);
-    for (const ClassTemplateDecl *CTD : UninstClasses)
-      removeIfInMainFile(CTD);
 
     raw_ostream *OS = nullptr;
     std::unique_ptr<raw_fd_ostream> OwnedStream;
