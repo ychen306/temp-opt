@@ -405,6 +405,24 @@ public:
         if (!Body)
           continue;
 
+        bool HasLambdaParam = false;
+        for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
+          QualType PTy = SpecFD->getParamDecl(I)->getType();
+          const clang::Type *Ty = PTy.getTypePtrOrNull();
+          if (!Ty)
+            continue;
+          if (const auto *RT = Ty->getAs<RecordType>()) {
+            if (const auto *RD = dyn_cast<CXXRecordDecl>(RT->getDecl())) {
+              if (RD->isLambda()) {
+                HasLambdaParam = true;
+                break;
+              }
+            }
+          }
+        }
+        if (HasLambdaParam)
+          continue;
+
         std::string Mangled = SpecFD->getQualifiedNameAsString() + ArgStr;
         std::string NewName = "__tempopt_fn_" + makeSafeIdentifier(Mangled);
 
