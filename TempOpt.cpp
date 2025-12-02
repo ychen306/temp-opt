@@ -443,6 +443,21 @@ public:
           OS << "\n";
         }
 
+        // Heuristic lowering for sizeof...(Is): replace it with the
+        // concrete pack size for this specialization. This assumes the
+        // pattern is exactly 'sizeof...(Is)' in the instantiated body.
+        {
+          std::string Pattern = "sizeof...(Is)";
+          if (!Pattern.empty() && !Pattern.compare(0, Pattern.size(), "sizeof...(Is)")) {
+            std::string CountStr = std::to_string(Args->size());
+            size_t Pos = 0;
+            while ((Pos = FuncText.find(Pattern, Pos)) != std::string::npos) {
+              FuncText.replace(Pos, Pattern.size(), CountStr);
+              Pos += CountStr.size();
+            }
+          }
+        }
+
         appendInNamespace(SpecFD->getDeclContext(), FuncText,
                           ExternalInsertText);
       }

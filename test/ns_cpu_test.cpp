@@ -22,7 +22,7 @@
 // CHECK: template struct Box<int>;
 
 // CHECK: int use_templates_in_ns() {
-// CHECK:   int sum = __tempopt_fn_outer__inner__add_int_(sa, sb);
+// CHECK:   int sum = outer::inner::__tempopt_fn_outer__inner__add_int_(sa, sb);
 // CHECK:   std::vector<int> v = {sa, sb, sum};
 // CHECK:   std::sort(v.begin(), v.end());
 // CHECK:   outer::inner::Holder<int> h{v.back()};
