@@ -10,7 +10,6 @@
 #include "clang/Rewrite/Core/Rewriter.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
@@ -59,21 +58,8 @@ public:
 
   // Collect all primary class templates that appear in non-system code.
   bool VisitClassTemplateDecl(ClassTemplateDecl *CTD) {
-    SourceLocation Loc = CTD->getLocation();
-    const SourceManager &SM = Context.getSourceManager();
     const ClassTemplateDecl *Canon = CTD->getCanonicalDecl();
     AllClassTemplates.insert(Canon);
-    return true;
-  }
-
-  // Record when a function template is actually specialized/instantiated.
-  bool VisitFunctionDecl(FunctionDecl *FD) {
-    return true;
-  }
-
-  // Record when a class template is specialized/instantiated.
-  bool
-  VisitClassTemplateSpecializationDecl(ClassTemplateSpecializationDecl *CTSD) {
     return true;
   }
 
@@ -84,52 +70,6 @@ public:
     TranslationUnitDecl *TU = Context.getTranslationUnitDecl();
     // Start recursive traversal from the translation unit.
     TraverseDecl(TU);
-  }
-
-  void collectUninstantiated(
-      SmallVectorImpl<const FunctionTemplateDecl *> &OutFuncs,
-      SmallVectorImpl<const ClassTemplateDecl *> &OutClasses) {
-    for (const FunctionTemplateDecl *FTD : AllFunctionTemplates) {
-      bool HasInstantiation = false;
-      for (const auto *Spec : FTD->specializations()) {
-        TemplateSpecializationKind K = Spec->getTemplateSpecializationKind();
-        switch (K) {
-        case TSK_ImplicitInstantiation:
-        case TSK_ExplicitInstantiationDeclaration:
-        case TSK_ExplicitInstantiationDefinition:
-        case TSK_ExplicitSpecialization:
-          HasInstantiation = true;
-          break;
-        case TSK_Undeclared:
-          break;
-        }
-        if (HasInstantiation)
-          break;
-      }
-      if (!HasInstantiation)
-        OutFuncs.push_back(FTD);
-    }
-
-    for (const ClassTemplateDecl *CTD : AllClassTemplates) {
-      bool HasInstantiation = false;
-      for (auto *Spec : CTD->specializations()) {
-        TemplateSpecializationKind K = Spec->getSpecializationKind();
-        switch (K) {
-        case TSK_ImplicitInstantiation:
-        case TSK_ExplicitInstantiationDeclaration:
-        case TSK_ExplicitInstantiationDefinition:
-        case TSK_ExplicitSpecialization:
-          HasInstantiation = true;
-          break;
-        case TSK_Undeclared:
-          break;
-        }
-        if (HasInstantiation)
-          break;
-      }
-      if (!HasInstantiation)
-        OutClasses.push_back(CTD);
-    }
   }
 
   const llvm::SmallPtrSet<const FunctionTemplateDecl *, 32> &
