@@ -523,6 +523,33 @@ public:
         if (K != TSK_ImplicitInstantiation)
           continue;
 
+        // Skip monomorphizing / specializing class templates where any
+        // template argument is a lambda closure type. Using lambdas in
+        // explicit specializations is not generally valid C++, and
+        // Clang prints them using diagnostic-style names.
+        bool HasLambdaArg = false;
+        const TemplateArgumentList &AllArgs = CTSD->getTemplateArgs();
+        for (const TemplateArgument &Arg : AllArgs.asArray()) {
+          if (Arg.getKind() == TemplateArgument::Type) {
+            QualType T = Arg.getAsType();
+            QualType NonRef = T.getNonReferenceType();
+            const clang::Type *Ty = NonRef.getTypePtrOrNull();
+            if (!Ty)
+              continue;
+            if (const auto *RT = Ty->getAs<RecordType>()) {
+              if (const auto *RD2 =
+                      dyn_cast<CXXRecordDecl>(RT->getDecl())) {
+                if (RD2->isLambda()) {
+                  HasLambdaArg = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        if (HasLambdaArg)
+          continue;
+
         const TemplateArgumentList &Args = CTSD->getTemplateArgs();
         std::string ArgStr = buildTemplateArgString(Args);
 
