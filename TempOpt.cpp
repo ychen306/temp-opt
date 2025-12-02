@@ -1,4 +1,5 @@
 #include "clang/AST/AST.h"
+#include "clang/AST/Attr.h"
 #include "clang/AST/PrettyPrinter.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -214,6 +215,12 @@ public:
         std::string RetStr = RetTy.getAsString(Policy);
         std::string QualName = SpecFD->getQualifiedNameAsString();
 
+        std::string AttrPrefix;
+        if (SpecFD->hasAttr<CUDAGlobalAttr>())
+          AttrPrefix += "__global__ ";
+        if (SpecFD->hasAttr<CUDADeviceAttr>())
+          AttrPrefix += "__device__ ";
+
         std::string ParamStr;
         for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
           if (I)
@@ -224,6 +231,7 @@ public:
 
         InsertText += "\n";
         InsertText += "template ";
+        InsertText += AttrPrefix;
         InsertText += RetStr;
         InsertText += " ";
         InsertText += QualName;
