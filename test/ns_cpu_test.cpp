@@ -5,11 +5,7 @@
 // CHECK: #include <string>
 // CHECK: #include "user_headers.h"
 
-// CHECK: namespace outer {
-// CHECK-NEXT: namespace inner {
-// CHECK-NEXT: template<> int add<int>(int a, int b) {
-// CHECK: } // namespace inner
-// CHECK: } // namespace outer
+// CHECK: int __tempopt_fn_outer__inner__add_int_(int a, int b) {
 
 // CHECK: namespace outer {
 // CHECK-NEXT: namespace inner {
@@ -26,9 +22,8 @@
 // CHECK: template struct Box<int>;
 
 // CHECK: int use_templates_in_ns() {
-// CHECK:   int sum = outer::inner::add(sa, sb);
+// CHECK:   int sum = __tempopt_fn_outer__inner__add_int_(sa, sb);
 // CHECK:   std::vector<int> v = {sa, sb, sum};
 // CHECK:   std::sort(v.begin(), v.end());
 // CHECK:   outer::inner::Holder<int> h{v.back()};
 // CHECK:   Box<int> bx{h.value};
-

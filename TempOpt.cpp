@@ -292,23 +292,11 @@ public:
             Out += " {\n";
           }
 
-          StringRef Printed = DeclText.ltrim();
-          StringRef Body = Printed;
-
-          if (Printed.starts_with("template")) {
-            size_t GT = Printed.find('>');
-            if (GT != StringRef::npos) {
-              Body = Printed.drop_front(GT + 1).ltrim();
-            }
-          }
-
-          Out += "template<> ";
-          Out += Body.str();
-          if (IsFunction)
-            Out += "\n";
-          else
-            Out += ";\n";
-
+          StringRef Printed = DeclText.rtrim();
+          Out += Printed.str();
+          if (!IsFunction && Printed.ends_with("}"))
+            Out += ";";
+          Out += "\n";
           for (auto It = Namespaces.rbegin(); It != Namespaces.rend(); ++It) {
             const NamespaceDecl *NS = *It;
             if (NS->isAnonymousNamespace())
@@ -319,7 +307,24 @@ public:
           }
         };
 
-    // Functions from headers (user, non-std)
+    // Simple sanitizer to turn arbitrary strings into valid identifiers.
+    auto makeSafeIdentifier = [](StringRef S) {
+      std::string R;
+      R.reserve(S.size() + 8);
+      for (char C : S) {
+        if ((C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+            (C >= '0' && C <= '9') || C == '_') {
+          R.push_back(C);
+        } else {
+          R.push_back('_');
+        }
+      }
+      if (!R.empty() && (R[0] >= '0' && R[0] <= '9'))
+        R.insert(R.begin(), '_');
+      return R;
+    };
+
+    // Functions from headers (user, non-std) -> emit monomorphic functions
     for (const FunctionTemplateDecl *FTD : FuncTemplates) {
       const FunctionDecl *TemplateFD = FTD->getTemplatedDecl();
       SourceLocation Loc = TemplateFD->getLocation();
@@ -363,13 +368,40 @@ public:
         if (!Body)
           continue;
 
-        std::string S;
-        raw_string_ostream OS(S);
-        SpecFD->print(OS, Policy);
-        OS.flush();
+        std::string Mangled = SpecFD->getQualifiedNameAsString() + ArgStr;
+        std::string NewName = "__tempopt_fn_" + makeSafeIdentifier(Mangled);
+        ExternalFuncNames[QualName] = NewName;
 
-        appendSpecializationInNamespace(SpecFD->getDeclContext(), S,
-                                        ExternalInsertText, /*IsFunction=*/true);
+        std::string FuncText;
+        {
+          raw_string_ostream OS(FuncText);
+
+          std::string AttrPrefix;
+          if (SpecFD->hasAttr<CUDAGlobalAttr>())
+            AttrPrefix += "__global__ ";
+          if (SpecFD->hasAttr<CUDADeviceAttr>())
+            AttrPrefix += "__device__ ";
+
+          QualType RetTy = SpecFD->getReturnType();
+          OS << AttrPrefix << RetTy.getAsString(Policy) << " " << NewName
+             << "(";
+          for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
+            if (I)
+              OS << ", ";
+            const ParmVarDecl *P = SpecFD->getParamDecl(I);
+            OS << P->getType().getAsString(Policy) << " ";
+            if (!P->getName().empty())
+              OS << P->getName();
+            else
+              OS << "param" << I;
+          }
+          OS << ") ";
+          SpecFD->getBody()->printPretty(OS, nullptr, Policy);
+          OS << "\n";
+        }
+
+        ExternalInsertText += "\n";
+        ExternalInsertText += FuncText;
       }
     }
 
@@ -382,6 +414,13 @@ public:
       FileID FID = SM.getFileID(SM.getSpellingLoc(Loc));
       if (FID == MainFileID)
         continue;
+
+      // Skip variadic class templates (parameter packs) for the same
+      // reason as functions.
+      if (const TemplateParameterList *TPL = CTD->getTemplateParameters()) {
+        if (TPL->hasParameterPack())
+          continue;
+      }
 
       if (isInStdNamespace(RD->getDeclContext()))
         continue;
@@ -414,6 +453,42 @@ public:
         appendSpecializationInNamespace(CTSD->getDeclContext(), S,
                                         ExternalInsertText, /*IsFunction=*/false);
       }
+    }
+
+    // Rewrite calls in the main file to use monomorphic header functions.
+    if (!ExternalFuncSeen.empty()) {
+      class CallUseRewriter : public RecursiveASTVisitor<CallUseRewriter> {
+      public:
+        CallUseRewriter(ASTContext &Ctx, Rewriter &R,
+                        const llvm::StringMap<std::string> &Map)
+            : Ctx(Ctx), R(R), MonoNames(Map) {}
+
+        bool VisitCallExpr(CallExpr *CE) {
+          const FunctionDecl *FD = CE->getDirectCallee();
+          if (!FD)
+            return true;
+
+          const FunctionDecl *Canon = FD->getCanonicalDecl();
+          auto It = MonoNames.find(Canon->getQualifiedNameAsString());
+          if (It == MonoNames.end())
+            return true;
+
+          Expr *Callee = CE->getCallee();
+          SourceRange CalleeRange = Callee->getSourceRange();
+          CharSourceRange Range =
+              CharSourceRange::getTokenRange(CalleeRange);
+          R.ReplaceText(Range, It->second);
+          return true;
+        }
+
+      private:
+        ASTContext &Ctx;
+        Rewriter &R;
+        const llvm::StringMap<std::string> &MonoNames;
+      };
+
+      CallUseRewriter RewriterVisitor(Ctx, TheRewriter, ExternalFuncNames);
+      RewriterVisitor.TraverseDecl(Ctx.getTranslationUnitDecl());
     }
 
     if (!ExternalInsertText.empty()) {
@@ -473,6 +548,7 @@ public:
 private:
   TemplateVisitor Visitor;
   Rewriter &TheRewriter;
+  llvm::StringMap<std::string> ExternalFuncNames;
 };
 
 // ========== FrontendAction to create the consumer ==========
