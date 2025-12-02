@@ -31,6 +31,18 @@ static cl::opt<std::string>
     OutputFile("o", cl::desc("Output file"), cl::value_desc("filename"),
                cl::init(""), cl::cat(ToolCategory));
 
+static bool isInStdNamespace(const DeclContext *DC) {
+  const DeclContext *Cur = DC;
+  while (Cur && !Cur->isTranslationUnit()) {
+    if (const auto *NS = dyn_cast<NamespaceDecl>(Cur)) {
+      if (!NS->isAnonymousNamespace() && NS->getName() == "std")
+        return true;
+    }
+    Cur = Cur->getParent();
+  }
+  return false;
+}
+
 // ========== The visitor (no-op) ==========
 class TemplateVisitor : public RecursiveASTVisitor<TemplateVisitor> {
 public:
@@ -40,9 +52,6 @@ public:
   bool VisitFunctionTemplateDecl(FunctionTemplateDecl *FTD) {
     SourceLocation Loc = FTD->getLocation();
     const SourceManager &SM = Context.getSourceManager();
-    if (SM.isInSystemHeader(Loc) || SM.isInSystemMacro(Loc))
-      return true;
-
     const FunctionTemplateDecl *Canon = FTD->getCanonicalDecl();
     AllFunctionTemplates.insert(Canon);
     return true;
@@ -52,9 +61,6 @@ public:
   bool VisitClassTemplateDecl(ClassTemplateDecl *CTD) {
     SourceLocation Loc = CTD->getLocation();
     const SourceManager &SM = Context.getSourceManager();
-    if (SM.isInSystemHeader(Loc) || SM.isInSystemMacro(Loc))
-      return true;
-
     const ClassTemplateDecl *Canon = CTD->getCanonicalDecl();
     AllClassTemplates.insert(Canon);
     return true;
@@ -175,6 +181,7 @@ public:
     const auto &FuncTemplates = Visitor.getFunctionTemplates();
     const auto &ClassTemplates = Visitor.getClassTemplates();
 
+    // === Explicit instantiation declarations for templates defined in this file ===
     for (const FunctionTemplateDecl *FTD : FuncTemplates) {
       const FunctionDecl *TemplateFD = FTD->getTemplatedDecl();
       SourceLocation Loc = TemplateFD->getLocation();
@@ -315,6 +322,182 @@ public:
         AfterSemi = Lexer::getLocForEndOfToken(End, 0, SM, Ctx.getLangOpts());
 
       TheRewriter.InsertTextAfter(AfterSemi, InsertText);
+    }
+
+    // === Explicit specialization definitions for templates defined in headers ===
+    std::string ExternalInsertText;
+    llvm::StringSet<> ExternalFuncSeen;
+    llvm::StringSet<> ExternalClassSeen;
+
+    auto appendSpecializationInNamespace =
+        [&](const DeclContext *DC, StringRef DeclText,
+            std::string &Out, bool IsFunction) {
+          SmallVector<const NamespaceDecl *, 4> Namespaces;
+          const DeclContext *Cur = DC;
+          while (Cur && !Cur->isTranslationUnit()) {
+            if (const auto *NS = dyn_cast<NamespaceDecl>(Cur))
+              Namespaces.push_back(NS);
+            Cur = Cur->getParent();
+          }
+          std::reverse(Namespaces.begin(), Namespaces.end());
+
+          Out += "\n";
+          for (const NamespaceDecl *NS : Namespaces) {
+            if (NS->isAnonymousNamespace())
+              continue;
+            if (NS->isInline())
+              Out += "inline ";
+            Out += "namespace ";
+            Out += NS->getNameAsString();
+            Out += " {\n";
+          }
+
+          StringRef Printed = DeclText.ltrim();
+          StringRef Body = Printed;
+
+          if (Printed.starts_with("template")) {
+            size_t GT = Printed.find('>');
+            if (GT != StringRef::npos) {
+              Body = Printed.drop_front(GT + 1).ltrim();
+            }
+          }
+
+          Out += "template<> ";
+          Out += Body.str();
+          if (IsFunction)
+            Out += "\n";
+          else
+            Out += ";\n";
+
+          for (auto It = Namespaces.rbegin(); It != Namespaces.rend(); ++It) {
+            const NamespaceDecl *NS = *It;
+            if (NS->isAnonymousNamespace())
+              continue;
+            Out += "} // namespace ";
+            Out += NS->getNameAsString();
+            Out += "\n";
+          }
+        };
+
+    // Functions from headers (user, non-std)
+    for (const FunctionTemplateDecl *FTD : FuncTemplates) {
+      const FunctionDecl *TemplateFD = FTD->getTemplatedDecl();
+      SourceLocation Loc = TemplateFD->getLocation();
+      if (SM.isInSystemHeader(Loc) || SM.isInSystemMacro(Loc))
+        continue;
+      FileID FID = SM.getFileID(SM.getSpellingLoc(Loc));
+      if (FID == MainFileID)
+        continue;
+
+      if (isInStdNamespace(TemplateFD->getDeclContext()))
+        continue;
+
+      const IdentifierInfo *FuncII = TemplateFD->getIdentifier();
+      if (!FuncII)
+        continue;
+      StringRef FuncName = FuncII->getName();
+      if (FuncName.size() >= 2 && FuncName[0] == '_' && FuncName[1] == '_')
+        continue;
+
+      for (auto *SpecFD : FTD->specializations()) {
+        auto *Info = SpecFD->getTemplateSpecializationInfo();
+        if (!Info)
+          continue;
+
+        TemplateSpecializationKind K = Info->getTemplateSpecializationKind();
+        if (K != TSK_ImplicitInstantiation)
+          continue;
+
+        const TemplateArgumentList *Args = Info->TemplateArguments;
+        if (!Args)
+          continue;
+        std::string ArgStr = buildTemplateArgString(*Args);
+
+        std::string QualName = SpecFD->getQualifiedNameAsString();
+        std::string Key = QualName + ArgStr;
+        if (!ExternalFuncSeen.insert(Key).second)
+          continue;
+
+        // Only handle if we have a body to duplicate.
+        const Stmt *Body = SpecFD->getBody();
+        if (!Body)
+          continue;
+
+        std::string S;
+        raw_string_ostream OS(S);
+        SpecFD->print(OS, Policy);
+        OS.flush();
+
+        appendSpecializationInNamespace(SpecFD->getDeclContext(), S,
+                                        ExternalInsertText, /*IsFunction=*/true);
+      }
+    }
+
+    // Classes from headers (user, non-std)
+    for (const ClassTemplateDecl *CTD : ClassTemplates) {
+      const CXXRecordDecl *RD = CTD->getTemplatedDecl();
+      SourceLocation Loc = RD->getLocation();
+      if (SM.isInSystemHeader(Loc) || SM.isInSystemMacro(Loc))
+        continue;
+      FileID FID = SM.getFileID(SM.getSpellingLoc(Loc));
+      if (FID == MainFileID)
+        continue;
+
+      if (isInStdNamespace(RD->getDeclContext()))
+        continue;
+
+      const IdentifierInfo *ClassII = RD->getIdentifier();
+      if (!ClassII)
+        continue;
+      StringRef ClassName = ClassII->getName();
+      if (ClassName.size() >= 2 && ClassName[0] == '_' && ClassName[1] == '_')
+        continue;
+
+      for (auto *CTSD : CTD->specializations()) {
+        TemplateSpecializationKind K = CTSD->getSpecializationKind();
+        if (K != TSK_ImplicitInstantiation)
+          continue;
+
+        const TemplateArgumentList &Args = CTSD->getTemplateArgs();
+        std::string ArgStr = buildTemplateArgString(Args);
+
+        std::string QualName = RD->getQualifiedNameAsString();
+        std::string Key = QualName + ArgStr;
+        if (!ExternalClassSeen.insert(Key).second)
+          continue;
+
+        std::string S;
+        raw_string_ostream OS(S);
+        CTSD->print(OS, Policy, 0);
+        OS.flush();
+
+        appendSpecializationInNamespace(CTSD->getDeclContext(), S,
+                                        ExternalInsertText, /*IsFunction=*/false);
+      }
+    }
+
+    if (!ExternalInsertText.empty()) {
+      StringRef Buffer = SM.getBufferData(MainFileID);
+      size_t InsertOffset = 0;
+      size_t Pos = 0;
+
+      while (Pos < Buffer.size()) {
+        size_t Found = Buffer.find("#include", Pos);
+        if (Found == StringRef::npos)
+          break;
+        if (Found == 0 || Buffer[Found - 1] == '\n') {
+          size_t LineEnd = Buffer.find('\n', Found);
+          if (LineEnd == StringRef::npos)
+            InsertOffset = Buffer.size();
+          else
+            InsertOffset = LineEnd + 1;
+        }
+        Pos = Found + 8;
+      }
+
+      SourceLocation InsertLoc =
+          SM.getLocForStartOfFile(MainFileID).getLocWithOffset(InsertOffset);
+      TheRewriter.InsertTextAfter(InsertLoc, ExternalInsertText);
     }
 
     if (OutputFile.empty())
