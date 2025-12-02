@@ -461,18 +461,24 @@ public:
           OS << "\n";
         }
 
-        // Heuristic lowering for sizeof...(Is): replace it with the
-        // concrete pack size for this specialization. This assumes the
-        // pattern is exactly 'sizeof...(Is)' in the instantiated body.
+        // Heuristic lowering for sizeof...: replace any occurrence of
+        // 'sizeof...(X)' with the concrete pack size for this specialization.
+        // We assume the argument of sizeof... is a simple expression without
+        // nested parentheses.
         {
-          std::string Pattern = "sizeof...(Is)";
-          if (!Pattern.empty() && !Pattern.compare(0, Pattern.size(), "sizeof...(Is)")) {
-            std::string CountStr = std::to_string(Args->size());
-            size_t Pos = 0;
-            while ((Pos = FuncText.find(Pattern, Pos)) != std::string::npos) {
-              FuncText.replace(Pos, Pattern.size(), CountStr);
-              Pos += CountStr.size();
+          std::string Pattern = "sizeof...(";
+          std::string CountStr = std::to_string(Args->size());
+          size_t Pos = 0;
+          while ((Pos = FuncText.find(Pattern, Pos)) != std::string::npos) {
+            size_t Open = Pos + Pattern.size() - 1; // points to '('
+            size_t Close = FuncText.find(')', Open);
+            if (Close == std::string::npos) {
+              Pos += Pattern.size();
+              continue;
             }
+            size_t Len = Close - Pos + 1;
+            FuncText.replace(Pos, Len, CountStr);
+            Pos += CountStr.size();
           }
         }
 
