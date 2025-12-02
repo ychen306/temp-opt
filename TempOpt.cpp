@@ -344,6 +344,45 @@ public:
       }
     };
 
+    // Local helper: detect functional-style casts 'T(expr)' in instantiated
+    // bodies for builtin/enum types. We currently use this only to decide
+    // whether to skip monomorphizing such functions, since faithfully and
+    // portably rewriting all such casts is tricky.
+    class BadFunctionalCastDetector
+        : public RecursiveASTVisitor<BadFunctionalCastDetector> {
+    public:
+      explicit BadFunctionalCastDetector(ASTContext &Ctx) : Ctx(Ctx) {}
+
+      bool VisitCXXFunctionalCastExpr(CXXFunctionalCastExpr *E) {
+        if (!E)
+          return true;
+        QualType QT = E->getTypeAsWritten();
+        if (QT.isNull())
+          QT = E->getType();
+        if (QT->isBuiltinType() || QT->isEnumeralType())
+          HasBadCast = true;
+        return true;
+      }
+
+      bool VisitCXXConstructExpr(CXXConstructExpr *E) {
+        if (!E)
+          return true;
+        QualType QT = E->getType();
+        if (QT.isNull())
+          return true;
+        if ((QT->isBuiltinType() || QT->isEnumeralType()) &&
+            E->getNumArgs() == 1)
+          HasBadCast = true;
+        return true;
+      }
+
+      bool hasBadCast() const { return HasBadCast; }
+
+    private:
+      ASTContext &Ctx;
+      bool HasBadCast = false;
+    };
+
     // Simple sanitizer to turn arbitrary strings into valid identifiers.
     auto makeSafeIdentifier = [](StringRef S) {
       std::string R;
@@ -405,30 +444,39 @@ public:
         if (!Body)
           continue;
 
-        // Skip monomorphizing functions that take lambda parameters for now.
-        // Use the non-reference pointee type so we correctly detect
-        // 'F &' / 'F &&' where F is a lambda closure type.
-        bool HasLambdaParam = false;
-        for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
-          QualType PTy = SpecFD->getParamDecl(I)->getType();
-          QualType NonRef = PTy.getNonReferenceType();
-          const clang::Type *Ty = NonRef.getTypePtrOrNull();
-          if (!Ty)
-            continue;
-          if (const auto *RT = Ty->getAs<RecordType>()) {
-            if (const auto *RD = dyn_cast<CXXRecordDecl>(RT->getDecl())) {
-              if (RD->isLambda()) {
-                HasLambdaParam = true;
-                break;
-              }
-            }
-          }
-        }
-        if (HasLambdaParam)
-          continue;
+	        // Skip monomorphizing functions that take lambda parameters for now.
+	        // Use the non-reference pointee type so we correctly detect
+	        // 'F &' / 'F &&' where F is a lambda closure type.
+	        bool HasLambdaParam = false;
+	        for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
+	          QualType PTy = SpecFD->getParamDecl(I)->getType();
+	          QualType NonRef = PTy.getNonReferenceType();
+	          const clang::Type *Ty = NonRef.getTypePtrOrNull();
+	          if (!Ty)
+	            continue;
+	          if (const auto *RT = Ty->getAs<RecordType>()) {
+	            if (const auto *RD = dyn_cast<CXXRecordDecl>(RT->getDecl())) {
+	              if (RD->isLambda()) {
+	                HasLambdaParam = true;
+	                break;
+	              }
+	            }
+	          }
+	        }
+	        if (HasLambdaParam)
+	          continue;
 
-        std::string Mangled = SpecFD->getQualifiedNameAsString() + ArgStr;
-        std::string NewName = "__tempopt_fn_" + makeSafeIdentifier(Mangled);
+	        // Also skip functions whose instantiated body contains functional-
+	        // style casts 'T(expr)' for builtin/enum T. Pretty-printing those
+	        // back to source is fragile (e.g. 'unsigned int(input)' is ill-
+	        // formed), and a correct AST-level lowering is non-trivial.
+	        BadFunctionalCastDetector CastDetector(Ctx);
+	        CastDetector.TraverseStmt(const_cast<Stmt *>(SpecFD->getBody()));
+	        if (CastDetector.hasBadCast())
+	          continue;
+
+	        std::string Mangled = SpecFD->getQualifiedNameAsString() + ArgStr;
+	        std::string NewName = "__tempopt_fn_" + makeSafeIdentifier(Mangled);
 
         std::string QualPrefix;
         size_t PosNS = QualName.rfind("::");
