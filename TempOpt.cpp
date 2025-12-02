@@ -405,10 +405,14 @@ public:
         if (!Body)
           continue;
 
+        // Skip monomorphizing functions that take lambda parameters for now.
+        // Use the non-reference pointee type so we correctly detect
+        // 'F &' / 'F &&' where F is a lambda closure type.
         bool HasLambdaParam = false;
         for (unsigned I = 0, E = SpecFD->getNumParams(); I != E; ++I) {
           QualType PTy = SpecFD->getParamDecl(I)->getType();
-          const clang::Type *Ty = PTy.getTypePtrOrNull();
+          QualType NonRef = PTy.getNonReferenceType();
+          const clang::Type *Ty = NonRef.getTypePtrOrNull();
           if (!Ty)
             continue;
           if (const auto *RT = Ty->getAs<RecordType>()) {
