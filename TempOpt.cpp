@@ -307,6 +307,43 @@ public:
           }
         };
 
+    auto appendInNamespace = [&](const DeclContext *DC, StringRef DeclText,
+                                 std::string &Out) {
+      SmallVector<const NamespaceDecl *, 4> Namespaces;
+      const DeclContext *Cur = DC;
+      while (Cur && !Cur->isTranslationUnit()) {
+        if (const auto *NS = dyn_cast<NamespaceDecl>(Cur))
+          Namespaces.push_back(NS);
+        Cur = Cur->getParent();
+      }
+      std::reverse(Namespaces.begin(), Namespaces.end());
+
+      Out += "\n";
+      for (const NamespaceDecl *NS : Namespaces) {
+        if (NS->isAnonymousNamespace())
+          continue;
+        if (NS->isInline())
+          Out += "inline ";
+        Out += "namespace ";
+        Out += NS->getNameAsString();
+        Out += " {\n";
+      }
+
+      StringRef Printed = DeclText.rtrim();
+      Out += Printed.str();
+      if (!Printed.ends_with("\n"))
+        Out += "\n";
+
+      for (auto It = Namespaces.rbegin(); It != Namespaces.rend(); ++It) {
+        const NamespaceDecl *NS = *It;
+        if (NS->isAnonymousNamespace())
+          continue;
+        Out += "} // namespace ";
+        Out += NS->getNameAsString();
+        Out += "\n";
+      }
+    };
+
     // Simple sanitizer to turn arbitrary strings into valid identifiers.
     auto makeSafeIdentifier = [](StringRef S) {
       std::string R;
@@ -370,7 +407,13 @@ public:
 
         std::string Mangled = SpecFD->getQualifiedNameAsString() + ArgStr;
         std::string NewName = "__tempopt_fn_" + makeSafeIdentifier(Mangled);
-        ExternalFuncNames[QualName] = NewName;
+
+        std::string QualPrefix;
+        size_t PosNS = QualName.rfind("::");
+        if (PosNS != std::string::npos)
+          QualPrefix = QualName.substr(0, PosNS + 2);
+
+        ExternalFuncNames[QualName] = QualPrefix + NewName;
 
         std::string FuncText;
         {
@@ -400,8 +443,8 @@ public:
           OS << "\n";
         }
 
-        ExternalInsertText += "\n";
-        ExternalInsertText += FuncText;
+        appendInNamespace(SpecFD->getDeclContext(), FuncText,
+                          ExternalInsertText);
       }
     }
 
